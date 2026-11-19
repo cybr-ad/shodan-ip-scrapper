@@ -1,159 +1,334 @@
 #!/usr/bin/env python3
 """
-Shodan IP Address Collector & Scraper
-Author: Assistant
-Description:
-    Collects IP addresses from Shodan search queries and writes them
-    one-per-line to a file (default: collected-ip.txt).
-    Supports:
-    1. Web Session Scraper: Uses authenticated browser session cookies (polito)
-       with HTML parsing and polite rate limiting.
-    2. Official Shodan API: Uses official Shodan API Key (recommended & ToS compliant).
+Shodan IP Address Collector
+Collects IP addresses from Shodan search results and saves them to a file.
+
+Supports two modes:
+  1. Web Scraper  - Parses Shodan web pages (authenticated via session cookie)
+  2. Official API - Uses the Shodan Python library (authenticated via API key)
+
+Usage:
+  Interactive:   python shodan_scraper.py
+  Web mode:      python shodan_scraper.py -m web -q "port:445" -p 5
+  API mode:      python shodan_scraper.py -m api -q "port:445" -k YOUR_KEY
 """
 
 import sys
 import os
 import re
+import json
 import time
 import argparse
 import ipaddress
 import urllib.parse
-from typing import List, Set, Dict, Optional, Tuple
+from typing import List, Set, Dict
 
 import requests
 from bs4 import BeautifulSoup
 
 try:
-    import shodan
+    import shodan as shodan_lib
     SHODAN_AVAILABLE = True
 except ImportError:
     SHODAN_AVAILABLE = False
 
 
-# ANSI color codes for terminal formatting
-class Colors:
-    HEADER = '\033[95m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
+# ---------------------------------------------------------------------------
+# Terminal colours
+# ---------------------------------------------------------------------------
+class C:
+    H  = '\033[95m'
+    B  = '\033[94m'
+    CN = '\033[96m'
+    G  = '\033[92m'
+    Y  = '\033[93m'
+    R  = '\033[91m'
+    X  = '\033[0m'
+    BO = '\033[1m'
 
 
-def enable_windows_ansi():
-    """Enable ANSI escape sequences on Windows consoles if supported."""
+def _win_ansi():
     if os.name == 'nt':
         try:
             import ctypes
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-            mode = ctypes.c_ulong()
-            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-                # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+            k = ctypes.windll.kernel32
+            h = k.GetStdHandle(-11)
+            m = ctypes.c_ulong()
+            if k.GetConsoleMode(h, ctypes.byref(m)):
+                k.SetConsoleMode(h, m.value | 0x0004)
         except Exception:
             pass
 
 
-def print_banner():
-    banner = f"""{Colors.CYAN}{Colors.BOLD}
+def banner():
+    print(f"""{C.CN}{C.BO}
 ========================================================================
                      SHODAN IP ADDRESS COLLECTOR
-========================================================================{Colors.RESET}
-  Target File: collected-ip.txt
-  Features   : Pagination, Rate-Limiting, Session Expiration Detection,
-               IPv4/IPv6 Validation, Real-Time File Sync
+========================================================================{C.X}
+  Output     : collected-ip.txt (default)
+  Features   : Pagination, Rate-Limiting, Cookie / API Key auth,
+               IPv4+IPv6 validation, real-time file sync
 ========================================================================
-"""
-    print(banner)
+""")
 
 
-def parse_cookie_input(cookie_input: str) -> Dict[str, str]:
+# ---------------------------------------------------------------------------
+# Cookie helpers
+# ---------------------------------------------------------------------------
+def _is_valid_cookie_value(val: str) -> bool:
+    """Checks if a cookie string looks like a real token rather than empty or placeholder."""
+    val = val.strip()
+    if not val:
+        return False
+    if len(val) < 8:
+        return False
+    if val in ("YOUR_SESSION_COOKIE", "YOUR_COOKIE_VALUE_HERE", "polito=YOUR_SESSION_COOKIE"):
+        return False
+    return True
+
+
+def load_credential_file(path: str = "credential.json") -> dict:
     """
-    Parses various cookie input formats:
-    - Raw value: 's%3Aabc123...'
-    - Key=Value: 'polito=s%3Aabc123...'
-    - Header line: 'Cookie: polito=s%3Aabc123...; __cf_bm=xyz'
+    Load credential.json or cookies.json.
+    Returns dict with 'api_key' and/or 'cookie'.
+    Supports:
+      - {"api_key": "...", "cookie": "..."}
+      - Cookie-Editor JSON array: [{"name": "polito", "value": "..."}, ...]
     """
-    cookie_input = cookie_input.strip()
-    if not cookie_input:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    out = {}
+
+    # 1. Try specified path (credential.json)
+    p = os.path.join(script_dir, path)
+    if os.path.isfile(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                # Cookie-Editor JSON array pasted directly into credential.json
+                cookies_list = []
+                for item in data:
+                    if isinstance(item, dict) and "name" in item and "value" in item:
+                        val = str(item["value"]).strip()
+                        if _is_valid_cookie_value(val):
+                            cookies_list.append(f"{item['name']}={val}")
+                if cookies_list:
+                    out["cookie"] = "; ".join(cookies_list)
+                else:
+                    print(f"{C.Y}[!] Notice: 'polito' cookie in {path} has an empty or invalid value.{C.X}")
+            elif isinstance(data, dict):
+                if data.get("api_key") and data["api_key"] not in ("", "YOUR_SHODAN_API_KEY"):
+                    out["api_key"] = data["api_key"].strip()
+                if data.get("cookie"):
+                    val = data["cookie"].strip()
+                    if _is_valid_cookie_value(val):
+                        out["cookie"] = val
+                    else:
+                        print(f"{C.Y}[!] Notice: 'cookie' in {path} has an empty or placeholder value.{C.X}")
+        except Exception:
+            pass
+
+    # 2. If no valid cookie found yet, try cookies.json (Cookie-Editor export file)
+    if "cookie" not in out:
+        cookies_path = os.path.join(script_dir, "cookies.json")
+        if os.path.isfile(cookies_path):
+            try:
+                with open(cookies_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    cookies_list = []
+                    for item in data:
+                        if isinstance(item, dict) and "name" in item and "value" in item:
+                            val = str(item["value"]).strip()
+                            if _is_valid_cookie_value(val):
+                                cookies_list.append(f"{item['name']}={val}")
+                    if cookies_list:
+                        out["cookie"] = "; ".join(cookies_list)
+                        print(f"{C.G}[i] Automatically loaded valid session cookies from cookies.json{C.X}")
+            except Exception:
+                pass
+
+    return out
+
+
+def parse_cookie_string(raw: str) -> Dict[str, str]:
+    """Turn user input into a {name: value} cookie dict.
+
+    Accepts:
+      - raw polito value                   s%3Aabc...
+      - name=value                         polito=s%3Aabc...
+      - full header                        Cookie: polito=s%3Aabc...; __cf_bm=xyz
+      - Cookie-Editor JSON export          [{"name":"polito","value":"..."}]
+      - our credential.json snippet        {"cookie":"polito=..."}
+    """
+    raw = raw.strip()
+    if not raw:
         return {}
 
-    # Strip header prefix if user pasted the entire "Cookie: ..." header
-    if cookie_input.lower().startswith("cookie:"):
-        cookie_input = cookie_input[7:].strip()
+    # If wrapped in quotes: "..." or '...'
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        raw = raw[1:-1].strip()
+
+    # Try JSON (Cookie-Editor list or our dict)
+    if raw.startswith("[") or raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, list):
+                cookies = {}
+                for item in obj:
+                    if isinstance(item, dict) and "name" in item and "value" in item:
+                        val = str(item["value"]).strip()
+                        if _is_valid_cookie_value(val):
+                            cookies[item["name"]] = val
+                if cookies:
+                    return cookies
+            if isinstance(obj, dict):
+                if "cookie" in obj:
+                    return parse_cookie_string(str(obj["cookie"]))
+                res = {}
+                for k, v in obj.items():
+                    val = str(v).strip()
+                    if _is_valid_cookie_value(val):
+                        res[str(k)] = val
+                return res
+        except json.JSONDecodeError:
+            pass
+
+    # Strip "Cookie:" prefix
+    if raw.lower().startswith("cookie:"):
+        raw = raw[7:].strip()
 
     cookies: Dict[str, str] = {}
-    if "=" in cookie_input:
-        parts = cookie_input.split(";")
-        for part in parts:
+    if "=" in raw:
+        for part in raw.split(";"):
             part = part.strip()
             if "=" in part:
                 k, v = part.split("=", 1)
-                cookies[k.strip()] = v.strip()
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and _is_valid_cookie_value(v):
+                    cookies[k] = v
     else:
-        # User pasted just the 'polito' session cookie value
-        cookies["polito"] = cookie_input
+        if _is_valid_cookie_value(raw):
+            cookies["polito"] = raw
 
     return cookies
 
 
-def extract_ips_from_html(html_content: str) -> List[str]:
-    """
-    Extracts valid IP addresses (IPv4 and IPv6) from Shodan search result HTML.
-    Targets host links (/host/<ip>) and search-result title elements.
-    Validates each candidate with the ipaddress module to prevent false positives.
-    """
-    soup = BeautifulSoup(html_content, "html.parser")
-    extracted: List[str] = []
+def read_multiline_cookie_input() -> str:
+    """Reads cookie input from terminal stdin, cleanly handling multi-line pasted JSON."""
+    first_line = sys.stdin.readline()
+    if not first_line:
+        return ""
+    line = first_line.strip()
+    if (line.startswith("[") and not line.endswith("]")) or (line.startswith("{") and not line.endswith("}")):
+        end_char = "]" if line.startswith("[") else "}"
+        lines = [line]
+        while True:
+            next_line = sys.stdin.readline()
+            if not next_line:
+                break
+            clean = next_line.strip()
+            lines.append(clean)
+            if clean.endswith(end_char):
+                break
+        return "\n".join(lines)
+    return line
+
+
+# ---------------------------------------------------------------------------
+# IP extraction
+# ---------------------------------------------------------------------------
+_HOST_IP_RE = re.compile(r'/host/([\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3})')
+_HOST_IPV6_RE = re.compile(r'/host/([0-9a-fA-F:]+)')
+_EXT_IP_RE = re.compile(r'href=["\']https?://([\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3})')
+
+
+def extract_ips(html: str) -> List[str]:
+    """Extract validated IP addresses from raw Shodan HTML."""
     seen: Set[str] = set()
+    result: List[str] = []
 
-    # Strategy 1: Find all /host/<ip> anchor links (primary Shodan format)
-    for a_tag in soup.find_all("a", href=True):
-        href = a_tag["href"].strip()
-        if href.startswith("/host/"):
-            # Clean off trailing paths, parameters, or hashes
-            potential_ip = href[len("/host/"):].split("/")[0].split("?")[0].split("#")[0].strip()
+    # Strategy 1: regex on raw text for /host/<ipv4>
+    for m in _HOST_IP_RE.finditer(html):
+        ip = m.group(1)
+        if ip not in seen:
             try:
-                ip_obj = ipaddress.ip_address(potential_ip)
-                if potential_ip not in seen:
-                    seen.add(potential_ip)
-                    extracted.append(potential_ip)
+                ipaddress.ip_address(ip)
+                seen.add(ip)
+                result.append(ip)
             except ValueError:
-                continue
+                pass
 
-    # Strategy 2: Search within result titles/headings if /host/ links were altered
-    if not extracted:
-        ip_regex = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-        for elem in soup.find_all(class_=re.compile(r"title|heading|ip")):
-            text = elem.get_text(strip=True)
-            match = ip_regex.search(text)
-            if match:
-                potential_ip = match.group(0)
+    # Strategy 2: IPv6 hosts
+    for m in _HOST_IPV6_RE.finditer(html):
+        ip = m.group(1)
+        if ip not in seen and ":" in ip:
+            try:
+                ipaddress.ip_address(ip)
+                seen.add(ip)
+                result.append(ip)
+            except ValueError:
+                pass
+
+    # Strategy 3: Result headings or external links href="http://<ip>:<port>"
+    if not result:
+        for m in _EXT_IP_RE.finditer(html):
+            ip = m.group(1)
+            if ip not in seen:
                 try:
-                    ipaddress.ip_address(potential_ip)
-                    if potential_ip not in seen:
-                        seen.add(potential_ip)
-                        extracted.append(potential_ip)
+                    ipaddress.ip_address(ip)
+                    seen.add(ip)
+                    result.append(ip)
                 except ValueError:
-                    continue
+                    pass
 
-    return extracted
+    # Strategy 4: fallback — BS4
+    if not result:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("/host/"):
+                    ip = href[6:].split("/")[0].split("?")[0].split("#")[0].strip()
+                    if ip not in seen:
+                        try:
+                            ipaddress.ip_address(ip)
+                            seen.add(ip)
+                            result.append(ip)
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+
+    return result
 
 
-def scrape_shodan_web(
-    query: str,
-    cookie_str: str = "",
-    max_pages: int = 10,
-    delay: float = 2.5,
-    output_path: str = "collected-ip.txt"
-) -> int:
-    """
-    Scrapes Shodan web search results page by page using a session cookie.
-    Handles polite rate limiting, redirects, session expiration, and Cloudflare alerts.
-    """
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+def _load_existing(path: str) -> Set[str]:
+    """Load already-collected IPs from file to avoid duplicates."""
+    existing: Set[str] = set()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    ip = line.strip()
+                    if ip:
+                        existing.add(ip)
+            if existing:
+                print(f"{C.B}[i] Loaded {len(existing)} existing IPs from {path}{C.X}")
+        except Exception:
+            pass
+    return existing
+
+
+# ---------------------------------------------------------------------------
+# Web scraper
+# ---------------------------------------------------------------------------
+def scrape_web(query: str, cookie_str: str, max_pages: int,
+               delay: float, output: str) -> int:
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
@@ -172,407 +347,364 @@ def scrape_shodan_web(
         "Sec-Fetch-User": "?1",
     })
 
-    cookies = parse_cookie_input(cookie_str)
+    cookies = parse_cookie_string(cookie_str)
     if cookies:
         session.cookies.update(cookies)
-        print(f"{Colors.GREEN}[+] Loaded session cookies: {', '.join(cookies.keys())}{Colors.RESET}")
+        print(f"{C.G}[+] Session cookies loaded: {', '.join(cookies.keys())}{C.X}")
     else:
-        print(f"{Colors.YELLOW}[!] No cookie provided. Querying as anonymous/guest (Shodan typically restricts pagination to 1 page).{Colors.RESET}")
+        print(f"{C.Y}[!] No valid cookie loaded — running as guest (pagination blocked on page 2).{C.X}")
 
-    all_collected_ips: Set[str] = set()
-    total_saved_this_run = 0
+    all_ips = _load_existing(output)
+    saved = 0
+    eq = urllib.parse.quote_plus(query)
+    page = 1
 
-    # Ensure output directory exists
-    output_dir = os.path.dirname(os.path.abspath(output_path))
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
+    print(f"\n{C.BO}[*] Query : {C.CN}{query}{C.X}")
+    print(f"[*] Delay : {delay}s   Max pages: {'unlimited' if max_pages <= 0 else max_pages}")
+    print(f"[*] Output: {os.path.abspath(output)}\n")
 
-    # Load existing IPs from file if file exists (to prevent writing duplicates)
-    if os.path.exists(output_path):
-        try:
-            with open(output_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    ip = line.strip()
-                    if ip:
-                        all_collected_ips.add(ip)
-            if all_collected_ips:
-                print(f"{Colors.BLUE}[i] Existing {output_path} loaded with {len(all_collected_ips)} IPs. Appending new unique entries.{Colors.RESET}")
-        except Exception as e:
-            print(f"{Colors.YELLOW}[!] Could not read existing output file: {e}{Colors.RESET}")
-
-    encoded_query = urllib.parse.quote_plus(query)
-    current_page = 1
-
-    print(f"\n{Colors.BOLD}[*] Starting Web Scrape for query: {Colors.CYAN}{query}{Colors.RESET}")
-    print(f"[*] Delay between pages: {delay}s | Max pages: {'Unlimited' if max_pages <= 0 else max_pages}")
-    print(f"[*] Output destination : {os.path.abspath(output_path)}\n")
-
-    with open(output_path, "a", encoding="utf-8") as out_file:
+    with open(output, "a", encoding="utf-8") as fout:
         while True:
-            if max_pages > 0 and current_page > max_pages:
-                print(f"\n{Colors.GREEN}[+] Reached configured maximum page limit ({max_pages}). Stopping cleanly.{Colors.RESET}")
+            if 0 < max_pages < page:
+                print(f"\n{C.G}[+] Reached page limit ({max_pages}). Done.{C.X}")
                 break
 
-            # Polite rate limiting between requests
-            if current_page > 1 and delay > 0:
+            if page > 1 and delay > 0:
                 time.sleep(delay)
 
-            url = f"https://www.shodan.io/search?query={encoded_query}&page={current_page}"
-            print(f"{Colors.BLUE}[*] Fetching Page {current_page}...{Colors.RESET} ({url})")
+            url = f"https://www.shodan.io/search?query={eq}&page={page}"
+            print(f"{C.B}[*] Page {page}...{C.X}  {url}")
 
-            try:
-                response = session.get(url, timeout=20, allow_redirects=True)
-            except requests.exceptions.RequestException as e:
-                print(f"{Colors.RED}[!] Network error fetching page {current_page}: {e}{Colors.RESET}")
-                print(f"{Colors.YELLOW}[!] Stopping run cleanly. All previously collected IPs are saved.{Colors.RESET}")
+            resp = None
+            for attempt in range(1, 4):
+                try:
+                    resp = session.get(url, timeout=30, allow_redirects=True)
+                except requests.RequestException as e:
+                    if attempt == 3:
+                        print(f"{C.R}[!] Network error: {e}{C.X}")
+                        resp = None
+                        break
+                    time.sleep(3)
+                    continue
+
+                # Check for transient Shodan 500 server error
+                if resp.status_code == 500 or (resp.status_code == 200 and "oops, something went wrong" in resp.text.lower()):
+                    if attempt < 3:
+                        wait_sec = attempt * 5
+                        print(f"{C.Y}[!] Shodan server busy ('Oops, something went wrong'). Retrying page {page} in {wait_sec}s (attempt {attempt}/3)...{C.X}")
+                        time.sleep(wait_sec)
+                        continue
                 break
 
-            # 1. Check Rate Limiting (HTTP 429)
-            if response.status_code == 429:
-                print(f"\n{Colors.RED}[!] HTTP 429 (Too Many Requests): Shodan rate limit reached.{Colors.RESET}")
-                print(f"{Colors.YELLOW}[!] Rate limit encountered. Stopping cleanly to prevent IP ban.{Colors.RESET}")
+            if resp is None:
                 break
 
-            # 2. Check Auth / Access Denial (HTTP 401 / 403)
-            if response.status_code in (401, 403):
-                text_lower = response.text.lower()
-                if "cloudflare" in text_lower or "challenge" in text_lower or "turnstile" in text_lower or "attention required" in text_lower:
-                    print(f"\n{Colors.RED}[!] HTTP {response.status_code}: Cloudflare bot protection / challenge triggered.{Colors.RESET}")
-                    print(f"{Colors.YELLOW}[!] Cloudflare blocked the automated browser session.")
-                    print(f"[!] Tip: To avoid Cloudflare scraping blocks, use Shodan's official API mode (-m api).{Colors.RESET}")
+            # --- error handling ---
+            if resp.status_code == 429:
+                print(f"{C.R}[!] Rate-limited (HTTP 429). Stopping cleanly.{C.X}")
+                break
+            if resp.status_code in (401, 403):
+                low = resp.text.lower()
+                if any(w in low for w in ("cloudflare", "challenge", "turnstile")):
+                    print(f"{C.R}[!] Cloudflare challenge on page {page}.{C.X}")
                 else:
-                    print(f"\n{Colors.RED}[!] HTTP {response.status_code}: Access Forbidden / Unauthorized.{Colors.RESET}")
-                    print(f"{Colors.YELLOW}[!] The session cookie may be invalid, expired, or access is blocked.{Colors.RESET}")
+                    print(f"{C.R}[!] HTTP {resp.status_code} — access denied / session expired.{C.X}")
+                break
+            if resp.status_code != 200:
+                print(f"{C.R}[!] HTTP {resp.status_code}. Stopping.{C.X}")
+                break
+            if "/account/login" in resp.url.lower():
+                print(f"{C.R}[!] Redirected to login — cookie expired or invalid.{C.X}")
                 break
 
-            # 3. Check for unexpected HTTP status
-            if response.status_code != 200:
-                print(f"\n{Colors.RED}[!] Received HTTP {response.status_code}. Stopping.{Colors.RESET}")
+            body = resp.text
+            low = body.lower()
+
+            # Check Shodan auth requirement message (happens on page 2 without valid login)
+            if "log in to access more results" in low or "create a shodan account and log in" in low:
+                print(f"\n{C.R}[!] Shodan Auth Required on Page {page}:{C.X}")
+                print(f"{C.YELLOW}    'Please create a Shodan account and log in to access more results.'{C.X}")
+                print(f"{C.YELLOW}    -> Your session cookie was missing, invalid, or expired.{C.X}")
+                print(f"{C.YELLOW}    -> Shodan allows guest searches on Page 1, but requires a logged-in cookie for Page 2+.{C.X}")
+                print(f"{C.YELLOW}    -> Please copy your real 'polito' cookie from Cookie-Editor and paste it.{C.X}")
                 break
 
-            # 4. Check for redirects to login page (Session Expired mid-run)
-            current_url = response.url.lower()
-            if "/account/login" in current_url or "/login" in current_url:
-                print(f"\n{Colors.RED}[!] Redirected to login page: {response.url}{Colors.RESET}")
-                print(f"{Colors.YELLOW}[!] Your Shodan session cookie has expired or is invalid.")
-                print(f"[!] Please log in to https://shodan.io in your browser and refresh your cookie.{Colors.RESET}")
+            # Check search usage limit
+            if "search usage limit reached" in low:
+                print(f"\n{C.R}[!] Shodan says: 'Search usage limit reached'.{C.X}")
+                print(f"{C.Y}    You MUST provide a valid session cookie (polito) to continue.{C.X}")
                 break
 
-            # 5. Check response content for account/auth limitations
-            body_lower = response.text.lower()
-            if "please log in to view search results" in body_lower or "you must be logged in to search" in body_lower:
-                print(f"\n{Colors.RED}[!] Shodan requires an authenticated session for this query.{Colors.RESET}")
-                print(f"{Colors.YELLOW}[!] Provide a valid 'polito' session cookie to access results.{Colors.RESET}")
+            # Check query no results
+            if "no results found" in low and page == 1:
+                print(f"{C.Y}[i] No results found for this query.{C.X}")
                 break
 
-            if "please upgrade your account to view more results" in body_lower or "upgrade your account" in body_lower:
-                print(f"\n{Colors.YELLOW}[i] Shodan account limit reached: 'Please upgrade your account to view more results'.")
-                print(f"[i] Free/standard accounts are restricted to viewing initial result pages on the web interface.{Colors.RESET}")
+            # Check account tier limit (free registered accounts can only access pages 1 and 2)
+            if (
+                "upgrade your account to view more results" in low
+                or "upgrade your account" in low
+                or "purchase a shodan membership" in low
+                or "more than 2 pages of results" in low
+            ):
+                print(f"\n{C.Y}[i] Shodan free account limit reached on Page {page}:{C.X}")
+                print(f"{C.Y}    'Please purchase a Shodan membership to access more than 2 pages of results.'{C.X}")
+                print(f"{C.Y}    Free registered accounts are restricted to 2 pages (20 results) on the web UI.{C.X}")
+                print(f"{C.Y}    All available results ({len(all_ips)} IPs) have been collected into your file!{C.X}")
                 break
 
-            if "no results found" in body_lower and current_page == 1:
-                print(f"\n{Colors.YELLOW}[i] Shodan reported no results found for query: '{query}'.{Colors.RESET}")
-                break
-
-            # 6. Extract IP addresses from page HTML
-            page_ips = extract_ips_from_html(response.text)
-
+            # --- extract IPs ---
+            page_ips = extract_ips(body)
             if not page_ips:
-                print(f"{Colors.YELLOW}[i] No IP addresses detected on page {current_page}. End of available results.{Colors.RESET}")
+                if page == 1:
+                    print(f"{C.Y}[i] Zero IPs detected on page 1. The session cookie may be invalid or missing.{C.X}")
+                else:
+                    print(f"{C.Y}[i] No more IPs detected on page {page}. End of available results.{C.X}")
                 break
 
-            # Append new IPs to file in real-time
-            new_ips = []
+            new = []
             for ip in page_ips:
-                if ip not in all_collected_ips:
-                    all_collected_ips.add(ip)
-                    new_ips.append(ip)
-                    out_file.write(f"{ip}\n")
-                    total_saved_this_run += 1
+                if ip not in all_ips:
+                    all_ips.add(ip)
+                    new.append(ip)
+                    fout.write(ip + "\n")
+                    saved += 1
+            fout.flush()
+            os.fsync(fout.fileno())
 
-            # Flush immediately to disk so data is never lost if interrupted
-            out_file.flush()
-            os.fsync(out_file.fileno())
+            print(f"{C.G}[+] Page {page}: {len(page_ips)} IPs "
+                  f"({len(new)} new unique) | total collected: {len(all_ips)}{C.X}")
+            page += 1
 
-            print(f"{Colors.GREEN}[+] Page {current_page}: Found {len(page_ips)} IPs ({len(new_ips)} new unique) | Total: {len(all_collected_ips)}{Colors.RESET}")
-
-            current_page += 1
-
-    return total_saved_this_run
+    return saved
 
 
-def run_official_api(
-    query: str,
-    api_key: str,
-    max_pages: int = 10,
-    delay: float = 1.0,
-    output_path: str = "collected-ip.txt"
-) -> int:
-    """
-    Queries Shodan using the official Shodan API library (recommended & ToS compliant).
-    """
+# ---------------------------------------------------------------------------
+# Official API
+# ---------------------------------------------------------------------------
+def scrape_api(query: str, api_key: str, max_pages: int,
+               delay: float, output: str) -> int:
     if not SHODAN_AVAILABLE:
-        print(f"{Colors.RED}[!] The 'shodan' python library is not installed.{Colors.RESET}")
-        print(f"Run: pip install shodan")
+        print(f"{C.R}[!] 'shodan' library not installed. Run: pip install shodan{C.X}")
+        return 0
+    if not api_key:
+        api_key = os.environ.get("SHODAN_API_KEY", "")
+    if not api_key:
+        print(f"{C.R}[!] No API key provided.{C.X}")
         return 0
 
-    api_key = api_key.strip()
-    if not api_key:
-        api_key = os.environ.get("SHODAN_API_KEY", "").strip()
-
-    if not api_key:
-        print(f"{Colors.RED}[!] No Shodan API Key provided. Set SHODAN_API_KEY or enter your key.{Colors.RESET}")
-        return 0
-
-    api = shodan.Shodan(api_key)
-
-    # Verify API key and query credits
+    api = shodan_lib.Shodan(api_key)
     try:
-        account_info = api.info()
-        print(f"{Colors.GREEN}[+] Authenticated to Shodan Official API!{Colors.RESET}")
-        print(f"    Query Credits Available: {account_info.get('query_credits', 'N/A')}")
-        print(f"    Scan Credits Available : {account_info.get('scan_credits', 'N/A')}")
-    except shodan.APIError as e:
-        print(f"{Colors.RED}[!] Shodan API Authentication Error: {e}{Colors.RESET}")
+        info = api.info()
+        print(f"{C.G}[+] API authenticated.  "
+              f"Query credits: {info.get('query_credits','?')}  "
+              f"Scan credits: {info.get('scan_credits','?')}{C.X}")
+        if info.get("query_credits", 1) == 0:
+            print(f"{C.Y}[!] Warning: 0 query credits remaining — search queries may fail.{C.X}")
+    except shodan_lib.APIError as e:
+        print(f"{C.R}[!] API auth error: {e}{C.X}")
         return 0
 
-    all_collected_ips: Set[str] = set()
-    total_saved_this_run = 0
+    all_ips = _load_existing(output)
+    saved = 0
+    page = 1
 
-    if os.path.exists(output_path):
-        try:
-            with open(output_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    ip = line.strip()
-                    if ip:
-                        all_collected_ips.add(ip)
-            if all_collected_ips:
-                print(f"{Colors.BLUE}[i] Existing {output_path} loaded with {len(all_collected_ips)} IPs. Appending new unique entries.{Colors.RESET}")
-        except Exception:
-            pass
+    print(f"\n{C.BO}[*] Query : {C.CN}{query}{C.X}")
+    print(f"[*] Output: {os.path.abspath(output)}\n")
 
-    current_page = 1
-    print(f"\n{Colors.BOLD}[*] Starting Official API Query: {Colors.CYAN}{query}{Colors.RESET}")
-    print(f"[*] Output destination: {os.path.abspath(output_path)}\n")
-
-    with open(output_path, "a", encoding="utf-8") as out_file:
+    with open(output, "a", encoding="utf-8") as fout:
         while True:
-            if max_pages > 0 and current_page > max_pages:
-                print(f"\n{Colors.GREEN}[+] Reached configured maximum page limit ({max_pages}). Stopping.{Colors.RESET}")
+            if 0 < max_pages < page:
+                print(f"\n{C.G}[+] Reached page limit ({max_pages}).{C.X}")
                 break
-
-            if current_page > 1 and delay > 0:
+            if page > 1 and delay > 0:
                 time.sleep(delay)
 
-            print(f"{Colors.BLUE}[*] Requesting Page {current_page} via API...{Colors.RESET}")
+            print(f"{C.B}[*] API page {page}...{C.X}")
             try:
-                results = api.search(query, page=current_page)
-            except shodan.APIError as e:
-                err_msg = str(e).lower()
-                if "invalid page" in err_msg or "empty" in err_msg or "no results" in err_msg:
-                    print(f"{Colors.YELLOW}[i] End of API results: {e}{Colors.RESET}")
-                elif "credits" in err_msg:
-                    print(f"{Colors.RED}[!] API Error: Insufficient query credits ({e}). Stopping.{Colors.RESET}")
-                elif "rate limit" in err_msg:
-                    print(f"{Colors.RED}[!] API Rate Limit Hit ({e}). Stopping cleanly.{Colors.RESET}")
+                results = api.search(query, page=page)
+            except shodan_lib.APIError as e:
+                msg = str(e).lower()
+                if any(w in msg for w in ("invalid", "empty", "no results")):
+                    print(f"{C.Y}[i] End of results: {e}{C.X}")
+                elif "credits" in msg:
+                    print(f"{C.R}[!] Insufficient credits: {e}{C.X}")
+                elif "rate" in msg:
+                    print(f"{C.R}[!] Rate limit: {e}{C.X}")
                 else:
-                    print(f"{Colors.RED}[!] Shodan API Error: {e}{Colors.RESET}")
+                    print(f"{C.R}[!] API error: {e}{C.X}")
                 break
 
             matches = results.get("matches", [])
-            total_matches = results.get("total", 0)
-
+            total = results.get("total", 0)
             if not matches:
-                if current_page == 1:
-                    print(f"{Colors.YELLOW}[i] No matches found for query: '{query}'{Colors.RESET}")
-                else:
-                    print(f"{Colors.YELLOW}[i] No more matches on page {current_page}. Reached end of results.{Colors.RESET}")
+                print(f"{C.Y}[i] No more matches (page {page}).{C.X}")
                 break
 
-            new_ips = []
-            for match in matches:
-                ip_str = match.get("ip_str")
-                if ip_str:
+            new = []
+            for m in matches:
+                ip = m.get("ip_str")
+                if ip and ip not in all_ips:
                     try:
-                        ipaddress.ip_address(ip_str)
-                        if ip_str not in all_collected_ips:
-                            all_collected_ips.add(ip_str)
-                            new_ips.append(ip_str)
-                            out_file.write(f"{ip_str}\n")
-                            total_saved_this_run += 1
+                        ipaddress.ip_address(ip)
+                        all_ips.add(ip)
+                        new.append(ip)
+                        fout.write(ip + "\n")
+                        saved += 1
                     except ValueError:
-                        continue
+                        pass
+            fout.flush()
+            os.fsync(fout.fileno())
 
-            out_file.flush()
-            os.fsync(out_file.fileno())
+            print(f"{C.G}[+] Page {page}: {len(matches)} results "
+                  f"({len(new)} new) | total unique: {len(all_ips)} "
+                  f"(API total: {total}){C.X}")
 
-            print(f"{Colors.GREEN}[+] Page {current_page}: Found {len(matches)} results ({len(new_ips)} new unique) | Total: {len(all_collected_ips)} (API Reported Total: {total_matches}){Colors.RESET}")
-
-            # If fewer than 100 results returned by page, this was the last page
             if len(matches) < 100:
-                print(f"{Colors.GREEN}[i] Received final page ({len(matches)} results < 100). Completed.{Colors.RESET}")
+                print(f"{C.G}[i] Last page received.{C.X}")
                 break
+            page += 1
 
-            current_page += 1
-
-    return total_saved_this_run
+    return saved
 
 
-def interactive_menu():
-    """Runs the interactive console wizard if no CLI arguments are supplied."""
-    print_banner()
+# ---------------------------------------------------------------------------
+# Interactive menu
+# ---------------------------------------------------------------------------
+def interactive():
+    banner()
 
-    print(f"{Colors.BOLD}Select Collection Mode:{Colors.RESET}")
-    print(f"  {Colors.CYAN}[1]{Colors.RESET} Web Session Scraper (HTML Parser via Browser Session Cookie)")
-    print(f"  {Colors.GREEN}[2]{Colors.RESET} Official Shodan API  (Recommended & ToS Compliant, uses API Key)")
-    print()
+    # Auto-load credentials
+    creds = load_credential_file()
 
-    mode_choice = input("Enter choice (1 or 2, default: 1): ").strip()
-    if mode_choice not in ("1", "2"):
-        mode_choice = "1"
+    print(f"{C.BO}Select mode:{C.X}")
+    print(f"  {C.CN}[1]{C.X} Web Scraper  (cookie-based, parses Shodan search)")
+    print(f"  {C.G}[2]{C.X} Official API (recommended, uses Shodan API key)")
+    choice = input("\nChoice (1/2, default 1): ").strip()
+    if choice not in ("1", "2"):
+        choice = "1"
 
-    print()
-    # Prompt for Shodan Query with validation
+    # Query
     while True:
-        query = input(f"{Colors.BOLD}Enter Shodan Search Query{Colors.RESET} (e.g. port:53,88,135 or apache): ").strip()
+        query = input(f"\n{C.BO}Shodan query{C.X} (e.g. port:53,88,135): ").strip()
         if query:
             break
-        print(f"{Colors.YELLOW}[!] Query cannot be empty. Please enter a valid Shodan query.{Colors.RESET}")
+        print(f"{C.Y}[!] Query cannot be empty.{C.X}")
 
-    output_path = input(f"\nEnter Output File (default: collected-ip.txt): ").strip()
-    if not output_path:
-        output_path = "collected-ip.txt"
+    output = input(f"\nOutput file (default: collected-ip.txt): ").strip() or "collected-ip.txt"
 
-    if mode_choice == "1":
-        print(f"\n{Colors.BOLD}--- Web Session Cookie (Optional for 1 page, Required for pagination) ---{Colors.RESET}")
+    if choice == "1":
+        # --- Web mode ---
+        print(f"\n{C.BO}--- Session Cookie ---{C.X}")
         print("How to get it:")
-        print("  1. Log in to https://www.shodan.io in your browser.")
-        print("  2. Press F12 to open Developer Tools.")
-        print("  3. Navigate to 'Application' (Chrome/Edge) or 'Storage' (Firefox) -> 'Cookies'.")
-        print("  4. Select 'https://www.shodan.io' and copy the value of the 'polito' cookie.")
-        print(f"{Colors.YELLOW}Security Note: Never share or publish session cookies; they grant full account access.{Colors.RESET}")
-        cookie_val = input("\nPaste 'polito' cookie value or full Cookie header (press Enter to skip): ").strip()
+        print("  Option 1: Cookie-Editor extension -> Export As -> JSON or Header String")
+        print("  Option 2: F12 -> Application -> Cookies -> shodan.io -> copy 'polito' value")
 
-        pages_input = input("\nMax pages to scrape (default: 10, enter 0 for unlimited): ").strip()
+        cookie_val = ""
+        if creds.get("cookie"):
+            print(f"\n{C.G}[i] Found valid cookie in credential.json / cookies.json — using it automatically.{C.X}")
+            cookie_val = creds["cookie"]
+        else:
+            print("\nPaste cookie (Header String or Cookie-Editor JSON), or press Enter for guest:")
+            print("> ", end="", flush=True)
+            cookie_val = read_multiline_cookie_input()
+
+        pages_in = input("\nMax pages (default 10, 0=unlimited): ").strip()
         try:
-            max_pages = int(pages_input) if pages_input else 10
+            max_pages = int(pages_in) if pages_in else 10
         except ValueError:
             max_pages = 10
 
-        delay_input = input("Delay between requests in seconds (default: 2.5): ").strip()
+        delay_in = input("Delay in seconds (default 2.5): ").strip()
         try:
-            delay = float(delay_input) if delay_input else 2.5
+            delay = float(delay_in) if delay_in else 2.5
         except ValueError:
             delay = 2.5
 
-        saved = scrape_shodan_web(
-            query=query,
-            cookie_str=cookie_val,
-            max_pages=max_pages,
-            delay=delay,
-            output_path=output_path
-        )
-    else:
-        print(f"\n{Colors.BOLD}--- Official Shodan API Key ---{Colors.RESET}")
-        print("How to get it:")
-        print("  1. Log in to https://account.shodan.io")
-        print("  2. Copy your API Key displayed on the dashboard.")
-        api_key = input("\nEnter your Shodan API Key: ").strip()
+        saved = scrape_web(query, cookie_val, max_pages, delay, output)
 
-        pages_input = input("\nMax pages to query (default: 10, enter 0 for unlimited): ").strip()
+    else:
+        # --- API mode ---
+        if creds.get("api_key"):
+            print(f"\n{C.G}[i] Found API key in credential.json — using it automatically.{C.X}")
+            api_key = creds["api_key"]
+        else:
+            api_key = input("\nShodan API key: ").strip()
+
+        pages_in = input("\nMax pages (default 10, 0=unlimited): ").strip()
         try:
-            max_pages = int(pages_input) if pages_input else 10
+            max_pages = int(pages_in) if pages_in else 10
         except ValueError:
             max_pages = 10
 
-        delay_input = input("Delay between requests in seconds (default: 1.0): ").strip()
+        delay_in = input("Delay in seconds (default 1.0): ").strip()
         try:
-            delay = float(delay_input) if delay_input else 1.0
+            delay = float(delay_in) if delay_in else 1.0
         except ValueError:
             delay = 1.0
 
-        saved = run_official_api(
-            query=query,
-            api_key=api_key,
-            max_pages=max_pages,
-            delay=delay,
-            output_path=output_path
-        )
+        saved = scrape_api(query, api_key, max_pages, delay, output)
 
-    print(f"\n{Colors.CYAN}========================================================================{Colors.RESET}")
-    print(f"{Colors.GREEN}{Colors.BOLD}[v] Finished! New unique IPs added this run: {saved}{Colors.RESET}")
-    print(f"[*] Check your output file: {Colors.BOLD}{os.path.abspath(output_path)}{Colors.RESET}")
-    print(f"{Colors.CYAN}========================================================================{Colors.RESET}")
+    print(f"\n{C.CN}{'='*72}{C.X}")
+    print(f"{C.G}{C.BO}[+] Done! {saved} new unique IPs saved.{C.X}")
+    print(f"[*] File: {C.BO}{os.path.abspath(output)}{C.X}")
+    print(f"{C.CN}{'='*72}{C.X}")
 
 
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 def main():
-    enable_windows_ansi()
+    _win_ansi()
 
     parser = argparse.ArgumentParser(
-        description="Collect IP addresses from Shodan search queries.",
+        description="Collect IPs from Shodan searches.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  Interactive Mode:
-    python shodan_scraper.py
+        epilog="""Examples:
+  python shodan_scraper.py                                      # interactive
+  python shodan_scraper.py -m web -q "apache" -p 5              # web, 5 pages
+  python shodan_scraper.py -m api -q "port:445" -k KEY -p 0     # API, all pages
+""")
+    parser.add_argument("-m", "--mode", choices=["web", "api"])
+    parser.add_argument("-q", "--query")
+    parser.add_argument("-c", "--cookie", default="")
+    parser.add_argument("-k", "--api-key", default="")
+    parser.add_argument("-p", "--pages", type=int, default=10)
+    parser.add_argument("-d", "--delay", type=float, default=None)
+    parser.add_argument("-o", "--output", default="collected-ip.txt")
 
-  Web Scraper Mode with Cookie:
-    python shodan_scraper.py -m web -q "port:53,88,135" -c "polito=s%3A..." --pages 5
-
-  Official API Mode:
-    python shodan_scraper.py -m api -q "port:445" -k "YOUR_API_KEY" --pages 3
-        """
-    )
-    parser.add_argument("-m", "--mode", choices=["web", "api"], help="Mode: 'web' (scraper) or 'api' (official API)")
-    parser.add_argument("-q", "--query", help="Shodan search query (e.g. port:53,88,135)")
-    parser.add_argument("-c", "--cookie", default="", help="Shodan session cookie (polito) for web mode")
-    parser.add_argument("-k", "--api-key", default="", help="Shodan API key for api mode")
-    parser.add_argument("-p", "--pages", type=int, default=10, help="Maximum number of pages to fetch (0 for all)")
-    parser.add_argument("-d", "--delay", type=float, default=None, help="Polite delay between requests in seconds")
-    parser.add_argument("-o", "--output", default="collected-ip.txt", help="Output file path (default: collected-ip.txt)")
-
-    # If no arguments were given on command line, launch interactive mode
     if len(sys.argv) == 1:
-        interactive_menu()
+        interactive()
         return
 
     args = parser.parse_args()
+    creds = load_credential_file()
+
+    if not args.cookie and creds.get("cookie"):
+        args.cookie = creds["cookie"]
+    if not args.api_key and creds.get("api_key"):
+        args.api_key = creds["api_key"]
 
     if not args.query:
-        print_banner()
-        while True:
-            args.query = input(f"{Colors.BOLD}Enter Shodan Search Query: {Colors.RESET}").strip()
-            if args.query:
-                break
-            print(f"{Colors.YELLOW}[!] Query cannot be empty.{Colors.RESET}")
+        args.query = input("Shodan query: ").strip()
+        if not args.query:
+            print("No query provided.")
+            return
 
     mode = args.mode or "web"
-
     if mode == "web":
         delay = args.delay if args.delay is not None else 2.5
-        saved = scrape_shodan_web(
-            query=args.query,
-            cookie_str=args.cookie,
-            max_pages=args.pages,
-            delay=delay,
-            output_path=args.output
-        )
+        saved = scrape_web(args.query, args.cookie, args.pages, delay, args.output)
     else:
         delay = args.delay if args.delay is not None else 1.0
-        saved = run_official_api(
-            query=args.query,
-            api_key=args.api_key,
-            max_pages=args.pages,
-            delay=delay,
-            output_path=args.output
-        )
+        saved = scrape_api(args.query, args.api_key, args.pages, delay, args.output)
 
-    print(f"\n{Colors.GREEN}[v] Done. {saved} new unique IPs saved to {args.output}{Colors.RESET}")
+    print(f"\n{C.G}[+] Done. {saved} new IPs -> {args.output}{C.X}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(f"\n{Colors.YELLOW}[!] Interrupted by user. Exiting cleanly. Saved IPs remain intact in output file.{Colors.RESET}")
+        print(f"\n{C.Y}[!] Interrupted. Saved IPs remain in the output file.{C.X}")
         sys.exit(0)
